@@ -1,5 +1,8 @@
 //! The browser shell: web `Services`, drag-and-drop, and the eframe web runner.
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use gridcraft_engine::Session;
 use gridcraft_ui_egui::{Inbox, Services, SheetApp};
 use wasm_bindgen::JsCast as _;
@@ -25,10 +28,8 @@ pub fn start() {
         {
             create.instance_descriptor.backends = eframe::wgpu::Backends::GL;
         }
-        // `?host=parent`: a same-origin page framing GridCraft (such as a Nextcloud app) opens
-        // workbooks in it and stores what it saves (`host`).
-        let bridge = if query_param("host").as_deref() == Some("parent") { crate::host::Bridge::new() } else { None };
-        let app_bridge = bridge.clone();
+        // Hosted mode (`?host`, in a frame): see `host.rs`.
+        let hosted = crate::host::hosted();
         let result = eframe::WebRunner::new()
             .start(
                 canvas,
@@ -36,18 +37,17 @@ pub fn start() {
                 Box::new(move |cc| {
                     let inbox: Inbox = Inbox::default();
                     let mut session = Session::new();
-                    // In host mode the parent sends the workbook to edit; no sample meanwhile.
-                    let q = if app_bridge.is_some() { String::new() } else { query() };
+                    // Hosted, the host sends the workbook to edit; no sample meanwhile.
+                    let q = if hosted { String::new() } else { query() };
                     if let Some(name) = q.split(['?', '&']).find_map(|kv| kv.strip_prefix("sample=")) {
                         let _ = session.execute("file.new", serde_json::json!({"sample": name}));
                     } else if q.contains("sample") {
                         let _ = session.execute("file.new", serde_json::json!({"sample": "sales"}));
                     }
-                    let mut services = services(inbox.clone(), cc.egui_ctx.clone());
-                    if let Some(bridge) = &app_bridge {
-                        bridge.connect(&mut services, inbox.clone(), cc.egui_ctx.clone());
-                    }
+                    let host_state = hosted.then(|| Rc::new(crate::host::HostState::default()));
+                    let services = services(inbox.clone(), cc.egui_ctx.clone(), host_state.clone());
                     let mut app = SheetApp::new(session, services);
+                    app.hosted = hosted;
                     app.ui.system_theme = true;
                     // Follow the browser's language, except a CJK one: the web build has no system
                     // CJK fonts (none are bundled), so that interface would render as tofu.
@@ -59,19 +59,20 @@ pub fn start() {
                         app.ui.language = browser;
                     }
                     SheetApp::setup_context_for_language(&cc.egui_ctx, false, app.ui.language);
-                    if let Some(bridge) = &app_bridge {
-                        if let Some(author) = query_param("author") {
-                            crate::host::Bridge::set_author(&mut app, &author);
-                        }
-                        bridge.post_ready();
+                    if hosted && let Some(author) = query_param("author").and_then(|a| crate::host_rules::clean_author(&a)) {
+                        app.session.prefs.user_name = author;
                     }
-                    Ok(Box::new(WebShell { app, inbox, bridge: app_bridge }))
+                    let app = Rc::new(RefCell::new(app));
+                    if let Some(state) = &host_state {
+                        match crate::host::listen(app.clone(), state.clone(), cc.egui_ctx.clone()) {
+                            Ok(()) => crate::host::post(&[("type", "ready".into())]),
+                            Err(e) => log::error!("hosted mode is unavailable: {e}"),
+                        }
+                    }
+                    Ok(Box::new(WebShell { app, inbox, host: host_state }))
                 }),
             )
             .await;
-        if let (Err(e), Some(bridge)) = (&result, &bridge) {
-            bridge.post_failed(&format!("{e:?}"));
-        }
         if let Some(el) = document.get_element_by_id(LOADING_ID) {
             match result {
                 Ok(()) => el.remove(),
@@ -90,15 +91,18 @@ fn query_param(key: &str) -> Option<String> {
 }
 
 struct WebShell {
-    app: SheetApp,
+    /// Shared with the host's message handler in hosted mode, which acts on the app between frames.
+    app: Rc<RefCell<SheetApp>>,
     inbox: Inbox,
-    bridge: Option<crate::host::Bridge>,
+    /// Hosted mode: what the page knows about its host.
+    host: Option<Rc<crate::host::HostState>>,
 }
 
 impl eframe::App for WebShell {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         let dropped = ctx.input_mut(|i| std::mem::take(&mut i.raw.dropped_files));
-        for f in dropped {
+        // Hosted, the host chooses the workbook: a dropped file is not opened.
+        for f in dropped.into_iter().filter(|_| self.host.is_none()) {
             let inbox = self.inbox.clone();
             let ctx = ctx.clone();
             wasm_bindgen_futures::spawn_local(async move {
@@ -112,22 +116,29 @@ impl eframe::App for WebShell {
                 }
             });
         }
-        self.app.logic(ctx);
+        if let Ok(mut app) = self.app.try_borrow_mut() {
+            app.logic(ctx);
+        }
     }
 
     fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {
-        self.app.raw_input_hook(raw);
+        if let Ok(mut app) = self.app.try_borrow_mut() {
+            app.raw_input_hook(raw);
+        }
     }
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
-        self.app.ui(ui);
-        if let Some(bridge) = &self.bridge {
-            bridge.sync(&mut self.app);
+        if let Ok(mut app) = self.app.try_borrow_mut() {
+            app.ui(ui);
+            if let Some(state) = &self.host {
+                crate::host::sync(state, &mut app);
+            }
         }
     }
 }
 
-fn services(inbox: Inbox, ctx: egui::Context) -> Services {
+/// `host` (hosted mode): saves and exports go to the host instead of the browser.
+fn services(inbox: Inbox, ctx: egui::Context, host: Option<Rc<crate::host::HostState>>) -> Services {
     let open_inbox = inbox.clone();
     let picture_ctx = ctx.clone();
     Services {
@@ -159,9 +170,12 @@ fn services(inbox: Inbox, ctx: egui::Context) -> Services {
                 ctx.request_repaint();
             });
         })),
-        download: Some(Box::new(|name: &str, bytes: &[u8]| {
-            if let Err(e) = download(name, bytes) {
-                log::error!("download of {name} failed: {e}");
+        download: Some(Box::new(move |name: &str, bytes: &[u8]| match &host {
+            Some(state) => crate::host::save(state, name, bytes),
+            None => {
+                if let Err(e) = download(name, bytes) {
+                    log::error!("download of {name} failed: {e}");
+                }
             }
         })),
         print: Some(Box::new(|bytes: &[u8]| {

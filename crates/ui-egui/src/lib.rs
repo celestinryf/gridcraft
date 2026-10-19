@@ -201,6 +201,13 @@ pub struct Services {
 /// Shared queue of files read asynchronously (browser file picker, drag and drop).
 pub type Inbox = std::sync::Arc<std::sync::Mutex<Vec<(String, Vec<u8>)>>>;
 
+/// What the user can't do in another app's frame (hosted mode): the host chooses the workbook and
+/// stores it, so nothing may open, start or close one. Saving and exporting hand their file to the
+/// host. The host's own calls go through [`SheetApp::open_bytes`] and [`SheetApp::execute`].
+pub fn hosted_blocks(id: &str) -> bool {
+    matches!(id, "file.new" | "file.open" | "file.close")
+}
+
 #[derive(Clone, Debug, Default)]
 pub struct Perf {
     pub frame_ms: f64,
@@ -245,6 +252,10 @@ pub struct SheetApp {
     /// Dismissible info bar under the ribbon (open-time notices).
     pub notice: Option<Notice>,
     pub services: Services,
+    /// In another app's frame (the web build's hosted mode): the host chooses the workbook and
+    /// stores it, so `run` refuses what would swap it ([`hosted_blocks`]). The host's own calls
+    /// ([`SheetApp::open_bytes`], [`SheetApp::execute`]) are not limited.
+    pub hosted: bool,
     pub printing: printing::State,
     print_feedback_seen: Option<printing::Feedback>,
     /// Synthetic input from agents, one batch per frame (drags need several frames).
@@ -302,6 +313,7 @@ impl SheetApp {
             toast: None,
             notice: None,
             services,
+            hosted: false,
             printing: Default::default(),
             print_feedback_seen: None,
             synthetic: Default::default(),
@@ -361,8 +373,18 @@ impl SheetApp {
         names
     }
 
-    /// Runs an engine command (or a UI command) and handles UI requests it makes.
+    /// Runs a command for the user, an agent or the control channel (see [`SheetApp::execute`]).
+    /// In another app's frame it refuses what would replace the host's workbook.
     pub fn run(&mut self, id: &str, params: Json) -> Result<Json, String> {
+        if self.hosted && hosted_blocks(id) {
+            return Err(format!("{id} is not available right now"));
+        }
+        self.execute(id, params)
+    }
+
+    /// Runs an engine command (or a UI command) and handles UI requests it makes. Unlike
+    /// [`SheetApp::run`] it is never limited by [`SheetApp::hosted`]: it is what the host calls.
+    pub fn execute(&mut self, id: &str, params: Json) -> Result<Json, String> {
         let r = self.run_command(id, params);
         // This copy leaves the system clipboard alone: note what it holds, so Paste can tell
         // that GridCraft's copy is newer while that text is still there.
@@ -1102,15 +1124,11 @@ impl SheetApp {
             .map(|i| std::mem::take(&mut *i.lock().unwrap_or_else(std::sync::PoisonError::into_inner)))
             .unwrap_or_default();
         for (name, bytes) in arrived {
-            let b64 = gridcraft_engine::io::base64_encode(&bytes);
-            match self.run("file.open", json!({"name": &name, "base64": &b64})) {
-                // A file picked from File › Open (web) arrives here: show it, not the Backstage.
-                Ok(r) => {
-                    self.backstage = None;
-                    self.show_open_warnings(&r);
-                }
+            match self.open_bytes(&name, &bytes) {
+                Ok(()) => {}
                 Err(e) if e.contains(gridcraft_engine::io::PASSWORD_REQUIRED) => {
                     self.backstage = None;
+                    let b64 = gridcraft_engine::io::base64_encode(&bytes);
                     self.open_dialog("openPassword", json!({"name": name, "base64": b64}));
                 }
                 Err(e) => self.message = Some(("GridCraft".into(), clean_error(&e))),
@@ -1120,6 +1138,19 @@ impl SheetApp {
         if self.session.active().is_none() {
             self.session.new_workbook();
         }
+    }
+
+    /// Opens a workbook from bytes as File › Open does (a file picked or dropped on the web, or
+    /// handed in by a host): it shows, not the Backstage, and its open-time warnings reach the
+    /// user. Not limited by [`SheetApp::hosted`], and it never asks about unsaved changes (a new
+    /// workbook joins the open ones). A failure is returned and shown nowhere; a password-protected
+    /// workbook fails with [`gridcraft_engine::io::PASSWORD_REQUIRED`] in the error.
+    pub fn open_bytes(&mut self, name: &str, bytes: &[u8]) -> Result<(), String> {
+        let b64 = gridcraft_engine::io::base64_encode(bytes);
+        let r = self.execute("file.open", json!({"name": name, "base64": b64}))?;
+        self.backstage = None;
+        self.show_open_warnings(&r);
+        Ok(())
     }
 
     pub fn raw_input_hook(&mut self, raw: &mut egui::RawInput) {
