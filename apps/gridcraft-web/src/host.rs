@@ -14,7 +14,8 @@
 //!
 //! To the host:
 //! - `{type: "ready"}` once the app is running and listening.
-//! - `{type: "opened", doc, ok, error?}` after an open.
+//! - `{type: "opened", doc, ok, ms, error?}` after an open.
+//! - `{type: "drawn", doc, ms, frames, frameMs}` once the first frame after an open has been drawn.
 //! - `{type: "save", doc, name, bytes: Uint8Array}` for every file GridCraft would otherwise
 //!   download: Save, Save As and the exports (CSV, PDF, ...). Saving an `.xlsx` counts as saving
 //!   the workbook; the host tells the two apart by the name.
@@ -40,6 +41,23 @@ pub struct HostState {
     doc: RefCell<String>,
     saved: RefCell<Vec<String>>,
     last_dirty: Cell<Option<bool>>,
+    drawing: RefCell<Option<Drawing>>,
+}
+
+struct Drawing {
+    doc: String,
+    since: f64,
+}
+
+pub fn after_frame(state: &HostState, frame_ms: f64) {
+    let Some(d) = state.drawing.borrow_mut().take() else { return };
+    post(&[
+        ("type", "drawn".into()),
+        ("doc", d.doc.into()),
+        ("ms", (js_sys::Date::now() - d.since).into()),
+        ("frames", 1u32.into()),
+        ("frameMs", frame_ms.into()),
+    ]);
 }
 
 /// Whether this page runs hosted: `host` is a key of the URL's query, and the page is in a frame.
@@ -137,6 +155,7 @@ pub fn listen(app: Rc<RefCell<SheetApp>>, state: Rc<HostState>, ctx: egui::Conte
         };
         match kind.as_str() {
             "open" => {
+                let started = js_sys::Date::now();
                 let opened = (|| {
                     let name = text("name").and_then(|n| clean_name(&n)).ok_or("the workbook has no name")?;
                     let bytes = field("bytes").and_then(|v| v.dyn_into::<js_sys::Uint8Array>().ok()).ok_or("the workbook has no bytes")?;
@@ -146,14 +165,17 @@ pub fn listen(app: Rc<RefCell<SheetApp>>, state: Rc<HostState>, ctx: egui::Conte
                     open(&mut app, &name, &bytes.to_vec())
                 })();
                 state.last_dirty.set(None);
+                let ms = js_sys::Date::now() - started;
                 match opened {
                     Ok(()) => {
                         *state.doc.borrow_mut() = doc.clone();
-                        post(&[("type", "opened".into()), ("doc", doc.into()), ("ok", true.into())]);
+                        *state.drawing.borrow_mut() = Some(Drawing { doc: doc.clone(), since: started });
+                        post(&[("type", "opened".into()), ("doc", doc.into()), ("ok", true.into()), ("ms", ms.into())]);
                     }
                     Err(err) => {
                         // Whatever is still on show is no workbook of the host's: its commands are ignored.
                         state.doc.borrow_mut().clear();
+                        *state.drawing.borrow_mut() = None;
                         log::warn!("host: open failed: {err}");
                         post(&[("type", "opened".into()), ("doc", doc.into()), ("ok", false.into()), ("error", err.into())]);
                     }

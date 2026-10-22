@@ -129,9 +129,11 @@ impl eframe::App for WebShell {
 
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         if let Ok(mut app) = self.app.try_borrow_mut() {
+            let started = js_sys::Date::now();
             app.ui(ui);
             if let Some(state) = &self.host {
                 crate::host::sync(state, &mut app);
+                crate::host::after_frame(state, js_sys::Date::now() - started);
             }
         }
     }
